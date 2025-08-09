@@ -5,13 +5,15 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p $PORT",
     "lint": "next lint"
   },
   "dependencies": {
     "@supabase/ssr": "^0.6.1",
     "@supabase/supabase-js": "^2.43.4",
     "autoprefixer": "^10.4.21",
+    "formidable": "^3.5.2",
+    "knowledge-base-service": "file:",
     "mammoth": "^1.9.1",
     "next": "14.2.3",
     "pdf-parse": "^1.1.1",

@@ -314,8 +314,8 @@ export class UnifiedCampaignContextBuilder {
 }
 
 // Export for backward compatibility
-export { 
+export type { 
   StructuredCampaignContext, 
   CampaignContextSection,
   GeminiContext 
-} from './CampaignContextBuilder'; 
+} from './CampaignContextBuilder';
