@@ -1,6 +1,7 @@
-"use client";
+// Server component wrapper; renders client dashboard inside
 
-import { ClientDashboard } from '@/components/ClientDashboard';
+import dynamic from 'next/dynamic';
+const ClientDashboard = dynamic(() => import('@/components/ClientDashboard').then(m => m.ClientDashboard), { ssr: false });
 
 export default function Page() {
   return (
