@@ -409,10 +409,17 @@ export function RealEstateCampaignGenerator({ client }: RealEstateCampaignGenera
                 body: JSON.stringify(requestData),
             });
 
-            const result = await response.json();
-
-            if (!response.ok) {
-                throw new Error(result.error || 'Campaign generation failed');
+            // Robust parse: prefer JSON, gracefully handle unexpected content types
+            const contentType = response.headers.get('content-type') || '';
+            let result: any = null;
+            if (contentType.includes('application/json')) {
+                result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error || 'Campaign generation failed');
+                }
+            } else {
+                const text = await response.text();
+                throw new Error(text || 'Service temporarily unavailable. Please try again.');
             }
 
             // Update current batch and metadata

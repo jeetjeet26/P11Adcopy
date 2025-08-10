@@ -9,13 +9,7 @@ import { CampaignContextBuilder, StructuredCampaignContext, EnhancedContextBuild
 import { EnhancedPromptGenerator } from '@/lib/context/EnhancedPromptGenerator';
 import { UnifiedCampaignContextBuilder } from '@/lib/context/UnifiedCampaignContextBuilder';
 
-// Initialize OpenAI client (ONLY for embeddings)
-const openai = new OpenAI({ 
-  apiKey: process.env.OPENAI_API_KEY 
-});
-
-// Initialize Gemini client (for generation with Google Maps tool)
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+// Clients are initialized lazily inside the request handler to avoid module-load failures
 
 // Real Estate Campaign Types and Ad Group Structure
 const RE_CAMPAIGN_TYPES = {
@@ -664,6 +658,25 @@ class CampaignDetailsExtractor {
  */
 export async function POST(req: NextRequest) {
   try {
+    // Validate required environment variables early and lazily
+    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+      return NextResponse.json({
+        success: false,
+        error: 'Server misconfiguration: Supabase URL or anon key missing.'
+      }, { status: 503 });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json({
+        success: false,
+        error: 'Server misconfiguration: OPENAI_API_KEY is not set.'
+      }, { status: 503 });
+    }
+
+    // Initialize clients lazily after env validation
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
     const body: SimplifiedCampaignRequest = await req.json();
     const { 
       clientId, 
@@ -761,13 +774,15 @@ export async function POST(req: NextRequest) {
     const embeddingResponses = await Promise.all(embeddingPromises);
     const queryEmbeddings = embeddingResponses.map(response => response.data[0].embedding);
     
-    // Execute parallel vector searches
+    // Execute parallel vector searches (optimize for Heroku 30s router timeout)
+    // Reduce per-query match count to speed up RPCs
+    const MATCH_COUNT = Number(process.env.MATCH_COUNT || 10);
     const searchPromises = queryEmbeddings.map(embedding =>
       supabase.rpc('match_chunks', {
         client_id_filter: clientId,
         query_embedding: embedding,
         match_threshold: 0.3,
-        match_count: 15, // 15 chunks per query = 60 total max
+        match_count: MATCH_COUNT, // optimized default 10 per query
       })
     );
     
@@ -918,10 +933,12 @@ export async function POST(req: NextRequest) {
     
     // Initialize Gemini model; only register Google Maps tool for proximity campaigns
     const enableMapsTool = campaignType === 're_proximity';
+    // Use faster default model to avoid router timeouts (can override via GEMINI_MODEL)
+    const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
     const model = genAI.getGenerativeModel(
       enableMapsTool
         ? {
-            model: "gemini-2.5-pro",
+            model: modelName,
             tools: [
               {
                 functionDeclarations: [
@@ -945,7 +962,7 @@ export async function POST(req: NextRequest) {
               },
             ],
           }
-        : { model: "gemini-2.5-pro" }
+        : { model: modelName }
     );
 
     // === PHASE 4.2: UNIFIED SYSTEM IMPLEMENTATION ===
@@ -999,79 +1016,70 @@ export async function POST(req: NextRequest) {
     let responseText: string = '';
     
     try {
-      
-      // Start conversation with Gemini
-      const chat = model.startChat();
-      let result = await chat.sendMessage(enhancedPrompt);
-      
-      // Handle function calls iteratively
-      let maxIterations = 10; // Prevent infinite loops
-      let iteration = 0;
-      
-      while (iteration < maxIterations) {
-        const response = result.response;
-        const candidates = response.candidates;
-        
-        if (!candidates || candidates.length === 0) {
-          throw new Error("Gemini response has no candidates");
+      if (!enableMapsTool) {
+        // Fast path: non-proximity campaigns don't need tool calling – use single-shot generation
+        const result = await model.generateContent(enhancedPrompt);
+        const text = result.response.text();
+        if (!text || text.trim().length === 0) {
+          throw new Error('Gemini returned empty response');
         }
-        
-        const firstCandidate = candidates[0];
-        if (!firstCandidate.content || !firstCandidate.content.parts) {
-          throw new Error("Gemini response has no content parts");
-        }
-        
-        let hasFunctionCalls = false;
-        const functionResponses = [];
-        
-        // Process all parts in the response
-        for (const part of firstCandidate.content.parts) {
-          if (part.functionCall) {
-            const { name, args } = part.functionCall;
-            // Only honor google_maps_places_query for proximity campaigns
-            if (enableMapsTool && name === 'google_maps_places_query') {
-              hasFunctionCalls = true;
-              const query = (args as { query: string }).query;
-              console.log(`[RE-CAMPAIGN] Calling Google Maps API: ${query}`);
-              const mapsResult = await callGoogleMapsAPI(query);
-              functionResponses.push({
-                functionResponse: {
-                  name: name,
-                  response: { result: mapsResult },
-                },
-              });
-            }
-          } else if (part.text) {
-            // If we have text and no function calls, we're done
-            if (!hasFunctionCalls) {
-              responseText = part.text;
-              console.log(`[RE-CAMPAIGN] Gemini generation completed successfully`);
-              break;
+        responseText = text;
+        console.log(`[RE-CAMPAIGN] Gemini generation completed successfully (fast path)`);
+      } else {
+        // Tool path: allow limited function call loop
+        const chat = model.startChat();
+        let result = await chat.sendMessage(enhancedPrompt);
+        let maxIterations = 5; // tighter loop limit for performance
+        let iteration = 0;
+        while (iteration < maxIterations) {
+          const response = result.response;
+          const candidates = response.candidates;
+          if (!candidates || candidates.length === 0) {
+            throw new Error('Gemini response has no candidates');
+          }
+          const firstCandidate = candidates[0];
+          if (!firstCandidate.content || !firstCandidate.content.parts) {
+            throw new Error('Gemini response has no content parts');
+          }
+          let hasFunctionCalls = false;
+          const functionResponses = [] as any[];
+          for (const part of firstCandidate.content.parts) {
+            if ((part as any).functionCall) {
+              const { name, args } = (part as any).functionCall;
+              if (enableMapsTool && name === 'google_maps_places_query') {
+                hasFunctionCalls = true;
+                const query = (args as { query: string }).query;
+                console.log(`[RE-CAMPAIGN] Calling Google Maps API: ${query}`);
+                const mapsResult = await callGoogleMapsAPI(query);
+                functionResponses.push({
+                  functionResponse: {
+                    name,
+                    response: { result: mapsResult },
+                  },
+                });
+              }
+            } else if ((part as any).text) {
+              if (!hasFunctionCalls) {
+                responseText = (part as any).text;
+                console.log(`[RE-CAMPAIGN] Gemini generation completed successfully (tool path)`);
+                break;
+              }
             }
           }
+          if (hasFunctionCalls && functionResponses.length > 0) {
+            console.log(`[RE-CAMPAIGN] Sending ${functionResponses.length} function response(s) back to Gemini...`);
+            result = await chat.sendMessage(functionResponses);
+            iteration++;
+          } else if (responseText) {
+            break;
+          } else {
+            throw new Error('Gemini returned neither function calls nor text');
+          }
         }
-        
-        // If we found function calls, send responses back to Gemini
-        if (hasFunctionCalls && functionResponses.length > 0) {
-          console.log(`[RE-CAMPAIGN] Sending ${functionResponses.length} function response(s) back to Gemini...`);
-          result = await chat.sendMessage(functionResponses);
-          iteration++;
-        } else if (responseText) {
-          // We got the final text response
-          break;
-        } else {
-          throw new Error("Gemini returned neither function calls nor text");
+        if (!responseText || responseText.trim().length === 0) {
+          throw new Error('Gemini returned empty text response after function calls');
         }
       }
-      
-      if (iteration >= maxIterations) {
-        throw new Error("Too many function call iterations - possible infinite loop");
-      }
-      
-      if (!responseText || responseText.trim().length === 0) {
-        throw new Error("Gemini returned empty text response after function calls");
-      }
-      
     } catch (geminiError) {
       console.error(`[RE-CAMPAIGN] Gemini generation failed:`, geminiError);
       throw new Error(`Gemini failed to generate copy: ${geminiError}`);
