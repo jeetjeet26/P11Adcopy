@@ -657,7 +657,25 @@ class CampaignDetailsExtractor {
  * To enable FULL prompt/response logging, change ENABLE_FULL_*_LOGGING to true
  */
 export async function POST(req: NextRequest) {
-  try {
+  // Timebox the entire request to avoid Heroku H12 (30s router timeout)
+  const TIMEBOX_MS = 25_000;
+
+  const timeboxPromise = new Promise<NextResponse>((resolve) => {
+    setTimeout(() => {
+      resolve(
+        NextResponse.json(
+          {
+            success: false,
+            error: 'Generation is taking longer than expected. Please try again.'
+          },
+          { status: 504 }
+        )
+      );
+    }, TIMEBOX_MS);
+  });
+
+  const mainLogic = (async () => {
+    try {
     // Validate required environment variables early and lazily
     if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
       return NextResponse.json({
@@ -774,13 +792,13 @@ export async function POST(req: NextRequest) {
     const embeddingResponses = await Promise.all(embeddingPromises);
     const queryEmbeddings = embeddingResponses.map(response => response.data[0].embedding);
     
-    // Execute parallel vector searches
+    // Execute parallel vector searches (reduced match_count for latency headroom)
     const searchPromises = queryEmbeddings.map(embedding =>
       supabase.rpc('match_chunks', {
         client_id_filter: clientId,
         query_embedding: embedding,
         match_threshold: 0.3,
-        match_count: 15, // 15 chunks per query = 60 total max
+        match_count: 10,
       })
     );
     
@@ -981,9 +999,14 @@ export async function POST(req: NextRequest) {
         }
         
         const encodedQuery = encodeURIComponent(query);
+        // Add a tight timeout for external HTTP to avoid overall request timeouts
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 6_000);
         const mapsResponse = await fetch(
-          `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodedQuery}&key=${googleMapsApiKey}`
+          `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodedQuery}&key=${googleMapsApiKey}`,
+          { signal: controller.signal }
         );
+        clearTimeout(timeout);
         
         const mapsData = await mapsResponse.json();
         
@@ -1525,4 +1548,8 @@ ${JSON.stringify(generatedCopy.headlines, null, 2)}`;
       error: error.message 
     }, { status: 500 });
   }
+  })();
+
+  // Return whichever completes first: main logic or timebox fallback
+  return await Promise.race([mainLogic, timeboxPromise]);
 } 
