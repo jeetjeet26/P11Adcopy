@@ -9,13 +9,7 @@ import { CampaignContextBuilder, StructuredCampaignContext, EnhancedContextBuild
 import { EnhancedPromptGenerator } from '@/lib/context/EnhancedPromptGenerator';
 import { UnifiedCampaignContextBuilder } from '@/lib/context/UnifiedCampaignContextBuilder';
 
-// Initialize OpenAI client (ONLY for embeddings)
-const openai = new OpenAI({ 
-  apiKey: process.env.OPENAI_API_KEY 
-});
-
-// Initialize Gemini client (for generation with Google Maps tool)
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+// Clients are initialized lazily inside the request handler to avoid module-load failures
 
 // Real Estate Campaign Types and Ad Group Structure
 const RE_CAMPAIGN_TYPES = {
@@ -664,6 +658,25 @@ class CampaignDetailsExtractor {
  */
 export async function POST(req: NextRequest) {
   try {
+    // Validate required environment variables early and lazily
+    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+      return NextResponse.json({
+        success: false,
+        error: 'Server misconfiguration: Supabase URL or anon key missing.'
+      }, { status: 503 });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json({
+        success: false,
+        error: 'Server misconfiguration: OPENAI_API_KEY is not set.'
+      }, { status: 503 });
+    }
+
+    // Initialize clients lazily after env validation
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
     const body: SimplifiedCampaignRequest = await req.json();
     const { 
       clientId, 
